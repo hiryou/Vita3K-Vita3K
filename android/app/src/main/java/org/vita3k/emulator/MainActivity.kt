@@ -1,12 +1,18 @@
 package org.vita3k.emulator
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import org.vita3k.emulator.data.AppStorage
+import org.vita3k.emulator.esde.EsdeBootContract
+import org.vita3k.emulator.esde.VitaEsdeZipResolver
 import org.vita3k.emulator.ui.navigation.AppNavigation
 import org.vita3k.emulator.ui.theme.Vita3KTheme
 import org.vita3k.emulator.ui.viewmodel.AppsListViewModel
@@ -15,6 +21,9 @@ import org.vita3k.emulator.ui.viewmodel.SettingsViewModel
 import org.vita3k.emulator.ui.viewmodel.UserManagementViewModel
 
 class MainActivity : AppCompatActivity() {
+    companion object {
+        private const val TAG = "Vita3K"
+    }
     private val appsListViewModel: AppsListViewModel by viewModels()
     private val installViewModel: InstallViewModel by viewModels()
     private val settingsViewModel: SettingsViewModel by viewModels()
@@ -104,6 +113,11 @@ class MainActivity : AppCompatActivity() {
         prepareFrontendRuntime()
         setTheme(R.style.Theme_Vita3K)
 
+        if (tryBootEsdeIntent(intent)) {
+            finish()
+            return
+        }
+
         val storagePath = AppStorage.storageRootPath(this)
         appsListViewModel.initialize(storagePath)
 
@@ -173,6 +187,66 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         prepareFrontendRuntime()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (tryBootEsdeIntent(intent)) {
+            finish()
+        }
+    }
+
+    private fun tryBootEsdeIntent(intent: Intent?): Boolean {
+        if (intent?.action != EsdeBootContract.BootRomAction) {
+            return false
+        }
+
+        val path = intent.getStringExtra(EsdeBootContract.PathExtra)?.takeIf { it.isNotBlank() }
+            ?.let(::resolveEsdeRomPath)
+        if (path == null) {
+            failEsdeBoot("Missing ROM path")
+            return true
+        }
+
+        val resolved = runCatching {
+            VitaEsdeZipResolver.resolve(path) {
+                if (!NativeLib.isInitialized()) {
+                    NativeLib.init(AppStorage.storageRootPath(this))
+                }
+                NativeLib.getAppListDetailed().map { app ->
+                    VitaEsdeZipResolver.InstalledApp(app.titleId, app.title)
+                }
+            }
+        }.getOrElse { error ->
+            Log.e(TAG, "Failed to resolve ES-DE zip boot request: $path", error)
+            null
+        }
+        if (resolved == null) {
+            Log.w(TAG, "Could not resolve Vita title ID from ES-DE ROM: $path")
+            failEsdeBoot(EsdeBootContract.ErrorMessage)
+            return true
+        }
+
+        Log.i(TAG, "Launching ${resolved.titleId} for ES-DE ROM $path (${resolved.source})")
+        startActivity(Emulator.createLaunchIntent(this, resolved.titleId, resolved.gameTitle))
+        return true
+    }
+
+    private fun resolveEsdeRomPath(raw: String): String {
+        if (!raw.startsWith("content://", ignoreCase = true)
+            && !raw.startsWith("file://", ignoreCase = true)
+        ) {
+            return raw
+        }
+
+        val uri = Uri.parse(raw)
+        StorageAccess.resolveUriToPath(this, uri)?.takeIf { it.isNotBlank() }?.let { return it }
+        return uri.lastPathSegment?.let(Uri::decode) ?: raw
+    }
+
+    private fun failEsdeBoot(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private fun ensureStorageAccess() {
