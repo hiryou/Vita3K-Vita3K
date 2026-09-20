@@ -11,7 +11,9 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.InputDevice;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.ViewGroup;
 import android.view.View;
@@ -60,6 +62,7 @@ import org.vita3k.emulator.overlay.OverlayLayout;
 import org.vita3k.emulator.overlay.OverlayStore;
 import org.vita3k.emulator.ui.screens.emulation.NativeImeOverlayHost;
 import org.vita3k.emulator.ui.screens.emulation.EmulationPauseMenuHost;
+import org.vita3k.emulator.ui.screens.emulation.PauseMenuKeyDispatcher;
 import org.vita3k.emulator.ui.viewmodel.EmulationSessionViewModel;
 import org.vita3k.emulator.ui.viewmodel.SettingsViewModel;
 
@@ -96,6 +99,8 @@ public class Emulator extends SDLActivity
     private boolean imeWasVisibleSinceRequest;
     private boolean suppressImeHiddenHandler;
     private boolean restoreImeAfterPauseMenu;
+    private int pauseMenuHatX;
+    private int pauseMenuHatY;
     private long lastImeCompletionUptimeMs;
     private RelativeLayout.LayoutParams lastTextInputLayoutParams;
     private int lastTextInputType;
@@ -306,6 +311,9 @@ public class Emulator extends SDLActivity
         }
 
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+            if (isPauseMenuConsumingControllerInput()) {
+                return dispatchPauseMenuKey(event);
+            }
             if (event.getAction() == KeyEvent.ACTION_UP
                     && event.getRepeatCount() == 0
                     && sessionViewModel != null
@@ -322,7 +330,75 @@ public class Emulator extends SDLActivity
             return true;
         }
 
+        if (isPauseMenuConsumingControllerInput()
+                && PauseMenuKeyDispatcher.isNavigationKey(event.getKeyCode())) {
+            return dispatchPauseMenuKey(event);
+        }
+
         return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if (!isPauseMenuConsumingControllerInput()
+                || (event.getSource() & InputDevice.SOURCE_JOYSTICK) == 0) {
+            pauseMenuHatX = 0;
+            pauseMenuHatY = 0;
+            return super.dispatchGenericMotionEvent(event);
+        }
+
+        final int hatX = hatDirection(event.getAxisValue(MotionEvent.AXIS_HAT_X));
+        final int hatY = hatDirection(event.getAxisValue(MotionEvent.AXIS_HAT_Y));
+        if (hatX != pauseMenuHatX) {
+            pauseMenuHatX = hatX;
+            if (hatX < 0) {
+                PauseMenuKeyDispatcher.dispatch(KeyEvent.KEYCODE_DPAD_LEFT);
+            } else if (hatX > 0) {
+                PauseMenuKeyDispatcher.dispatch(KeyEvent.KEYCODE_DPAD_RIGHT);
+            }
+        }
+        if (hatY != pauseMenuHatY) {
+            pauseMenuHatY = hatY;
+            if (hatY < 0) {
+                PauseMenuKeyDispatcher.dispatch(KeyEvent.KEYCODE_DPAD_UP);
+            } else if (hatY > 0) {
+                PauseMenuKeyDispatcher.dispatch(KeyEvent.KEYCODE_DPAD_DOWN);
+            }
+        }
+        return true;
+    }
+
+    private boolean isPauseMenuConsumingControllerInput() {
+        return sessionViewModel != null
+                && !isFinishing()
+                && (sessionViewModel.getUiState().getShowMenu()
+                || sessionViewModel.getUiState().getShowExitConfirmation());
+    }
+
+    private boolean dispatchPauseMenuKey(KeyEvent event) {
+        final int keyCode = event.getKeyCode();
+        final boolean backLike = keyCode == KeyEvent.KEYCODE_BACK
+                || keyCode == KeyEvent.KEYCODE_BUTTON_B
+                || keyCode == KeyEvent.KEYCODE_BUTTON_SELECT;
+        // Close/back keys fire on ACTION_UP so a BACK that closes the menu cannot
+        // also hit handleBackPressed on the same key-up and immediately reopen it.
+        final boolean shouldDispatch = backLike
+                ? event.getAction() == KeyEvent.ACTION_UP && event.getRepeatCount() == 0
+                : event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0;
+        if (shouldDispatch) {
+            PauseMenuKeyDispatcher.dispatch(keyCode);
+        }
+        return true;
+    }
+
+    private static int hatDirection(float value) {
+        if (value > 0.5f) {
+            return 1;
+        }
+        if (value < -0.5f) {
+            return -1;
+        }
+        return 0;
     }
 
     @Keep

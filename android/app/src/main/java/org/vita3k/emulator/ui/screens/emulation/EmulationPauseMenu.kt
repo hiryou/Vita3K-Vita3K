@@ -8,8 +8,10 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
+import android.view.KeyEvent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -54,11 +56,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -127,6 +131,105 @@ private enum class PauseMenuTab(val labelRes: Int, val icon: ImageVector) {
     Settings(R.string.emulation_tab_settings, Icons.Default.Settings)
 }
 
+private enum class PauseFocus {
+    Close,
+    TabSession,
+    TabControls,
+    TabController,
+    TabSettings,
+    Resume,
+    Exit,
+    SaveConfig,
+    ResetConfig,
+    OpenSettings,
+    DialogCancel,
+    DialogConfirm;
+
+    val isDialog: Boolean
+        get() = this == DialogCancel || this == DialogConfirm
+}
+
+private fun PauseMenuTab.toFocus(): PauseFocus = when (this) {
+    PauseMenuTab.Session -> PauseFocus.TabSession
+    PauseMenuTab.Controls -> PauseFocus.TabControls
+    PauseMenuTab.Controller -> PauseFocus.TabController
+    PauseMenuTab.Settings -> PauseFocus.TabSettings
+}
+
+private fun PauseFocus.toTab(): PauseMenuTab? = when (this) {
+    PauseFocus.TabSession -> PauseMenuTab.Session
+    PauseFocus.TabControls -> PauseMenuTab.Controls
+    PauseFocus.TabController -> PauseMenuTab.Controller
+    PauseFocus.TabSettings -> PauseMenuTab.Settings
+    else -> null
+}
+
+private fun pauseFocusGroups(
+    tab: PauseMenuTab,
+    settingsLoaded: Boolean,
+    canReset: Boolean,
+    dialog: Boolean
+): List<List<PauseFocus>> {
+    if (dialog) {
+        return listOf(listOf(PauseFocus.DialogCancel, PauseFocus.DialogConfirm))
+    }
+
+    val groups = mutableListOf(
+        listOf(PauseFocus.Close),
+        listOf(
+            PauseFocus.TabSession,
+            PauseFocus.TabControls,
+            PauseFocus.TabController,
+            PauseFocus.TabSettings
+        )
+    )
+    if (tab == PauseMenuTab.Session) {
+        groups += listOf(PauseFocus.Resume, PauseFocus.Exit)
+        if (settingsLoaded) {
+            groups += if (canReset) {
+                listOf(PauseFocus.SaveConfig, PauseFocus.ResetConfig)
+            } else {
+                listOf(PauseFocus.SaveConfig)
+            }
+            groups += listOf(PauseFocus.OpenSettings)
+        }
+    }
+    return groups
+}
+
+private fun movePauseFocus(
+    current: PauseFocus,
+    keyCode: Int,
+    groups: List<List<PauseFocus>>
+): PauseFocus {
+    val groupIndex = groups.indexOfFirst { current in it }.takeIf { it >= 0 } ?: 0
+    val group = groups[groupIndex]
+    val itemIndex = group.indexOf(current).coerceAtLeast(0)
+    return when (keyCode) {
+        KeyEvent.KEYCODE_DPAD_LEFT -> group[(itemIndex + group.size - 1) % group.size]
+        KeyEvent.KEYCODE_DPAD_RIGHT -> group[(itemIndex + 1) % group.size]
+        KeyEvent.KEYCODE_DPAD_UP -> {
+            val nextGroup = groups[(groupIndex + groups.size - 1) % groups.size]
+            nextGroup[itemIndex.coerceAtMost(nextGroup.lastIndex)]
+        }
+        KeyEvent.KEYCODE_DPAD_DOWN -> {
+            val nextGroup = groups[(groupIndex + 1) % groups.size]
+            nextGroup[itemIndex.coerceAtMost(nextGroup.lastIndex)]
+        }
+        else -> current
+    }
+}
+
+@Composable
+private fun Modifier.controllerHighlight(selected: Boolean): Modifier {
+    val color = MaterialTheme.colorScheme.primary
+    return if (selected) {
+        border(width = 2.dp, color = color, shape = RoundedCornerShape(18.dp))
+    } else {
+        this
+    }
+}
+
 private fun formatRestartRequiredSettings(
     context: android.content.Context,
     settings: List<RestartRequiredSetting>
@@ -145,12 +248,15 @@ private fun EmulationPauseMenu(
     val uiState = sessionViewModel.uiState
     val context = LocalContext.current
     var selectedTab by remember { mutableStateOf(PauseMenuTab.Session) }
+    var focus by remember { mutableStateOf(PauseFocus.Resume) }
     var pendingHelp by remember { mutableStateOf<SettingsHelpEntry?>(null) }
     var pendingRestartSettings by remember { mutableStateOf<List<RestartRequiredSetting>?>(null) }
     var requestedSettingsScope by remember { mutableStateOf<PauseSettingsScope?>(null) }
     val connectedGamepads = rememberConnectedGamepads(context)
     val menuVisibilityState = remember { MutableTransitionState(false) }
     val controlsVisibilityState = remember { MutableTransitionState(false) }
+    val settingsLoaded = uiState.titleId.isNotBlank() && settingsViewModel.isLoaded(uiState.titleId)
+    val canResetConfig = settingsLoaded && settingsViewModel.hasCustomConfig && !settingsViewModel.saving
 
     LaunchedEffect(uiState.titleId) {
         if (uiState.titleId.isNotBlank()) {
@@ -167,8 +273,152 @@ private fun EmulationPauseMenu(
     LaunchedEffect(uiState.showMenu) {
         if (uiState.showMenu) {
             selectedTab = PauseMenuTab.Session
+            focus = PauseFocus.Resume
         }
         menuVisibilityState.targetState = uiState.showMenu
+    }
+
+    LaunchedEffect(uiState.showExitConfirmation) {
+        focus = if (uiState.showExitConfirmation) {
+            PauseFocus.DialogCancel
+        } else if (focus.isDialog) {
+            PauseFocus.Exit
+        } else {
+            focus
+        }
+    }
+
+    val onControllerKey by rememberUpdatedState<(Int) -> Boolean> { keyCode ->
+        if (pendingHelp != null) {
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_B
+                || keyCode == KeyEvent.KEYCODE_BACK
+                || keyCode == KeyEvent.KEYCODE_BUTTON_SELECT
+                || keyCode == KeyEvent.KEYCODE_BUTTON_A
+                || keyCode == KeyEvent.KEYCODE_DPAD_CENTER
+                || keyCode == KeyEvent.KEYCODE_ENTER
+                || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+            ) {
+                pendingHelp = null
+            }
+            return@rememberUpdatedState true
+        }
+        if (pendingRestartSettings != null) {
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_B
+                || keyCode == KeyEvent.KEYCODE_BACK
+                || keyCode == KeyEvent.KEYCODE_BUTTON_SELECT
+            ) {
+                pendingRestartSettings = null
+            }
+            return@rememberUpdatedState true
+        }
+        if (settingsViewModel.operationResult != null) {
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_A
+                || keyCode == KeyEvent.KEYCODE_DPAD_CENTER
+                || keyCode == KeyEvent.KEYCODE_ENTER
+                || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+                || keyCode == KeyEvent.KEYCODE_BUTTON_B
+                || keyCode == KeyEvent.KEYCODE_BACK
+            ) {
+                settingsViewModel.dismissOperationResult()
+            }
+            return@rememberUpdatedState true
+        }
+        if (globalSettingsViewModel.operationResult != null) {
+            if (keyCode == KeyEvent.KEYCODE_BUTTON_A
+                || keyCode == KeyEvent.KEYCODE_DPAD_CENTER
+                || keyCode == KeyEvent.KEYCODE_ENTER
+                || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+                || keyCode == KeyEvent.KEYCODE_BUTTON_B
+                || keyCode == KeyEvent.KEYCODE_BACK
+            ) {
+                globalSettingsViewModel.dismissOperationResult()
+            }
+            return@rememberUpdatedState true
+        }
+
+        val groups = pauseFocusGroups(
+            tab = selectedTab,
+            settingsLoaded = settingsLoaded,
+            canReset = canResetConfig,
+            dialog = uiState.showExitConfirmation
+        )
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                val next = movePauseFocus(focus, keyCode, groups)
+                focus = next
+                next.toTab()?.let { selectedTab = it }
+                true
+            }
+            KeyEvent.KEYCODE_BUTTON_B,
+            KeyEvent.KEYCODE_BACK,
+            KeyEvent.KEYCODE_BUTTON_SELECT -> {
+                if (uiState.showExitConfirmation) {
+                    sessionViewModel.dismissExitConfirmation()
+                } else {
+                    sessionViewModel.closeMenu(activity)
+                }
+                true
+            }
+            KeyEvent.KEYCODE_BUTTON_A,
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                when (focus) {
+                    PauseFocus.Close -> sessionViewModel.closeMenu(activity)
+                    PauseFocus.TabSession,
+                    PauseFocus.TabControls,
+                    PauseFocus.TabController,
+                    PauseFocus.TabSettings -> focus.toTab()?.let { selectedTab = it }
+                    PauseFocus.Resume -> sessionViewModel.togglePause(activity)
+                    PauseFocus.Exit -> sessionViewModel.requestExit()
+                    PauseFocus.SaveConfig -> {
+                        settingsViewModel.save(forceCustomConfig = true) { restartRequired ->
+                            sessionViewModel.promoteOverlayToGameOverride(activity)
+                            if (restartRequired.isEmpty()) {
+                                sessionViewModel.showStatusMessage(
+                                    activity.getString(R.string.emulation_settings_saved)
+                                )
+                            } else {
+                                pendingRestartSettings = restartRequired
+                            }
+                        }
+                    }
+                    PauseFocus.ResetConfig -> {
+                        settingsViewModel.deleteCustomConfig { restartRequired ->
+                            sessionViewModel.clearGameOverlayOverride(activity)
+                            if (restartRequired.isEmpty()) {
+                                sessionViewModel.showStatusMessage(
+                                    activity.getString(R.string.emulation_settings_saved)
+                                )
+                            } else {
+                                pendingRestartSettings = restartRequired
+                            }
+                        }
+                    }
+                    PauseFocus.OpenSettings -> {
+                        requestedSettingsScope = PauseSettingsScope.CustomConfig
+                        selectedTab = PauseMenuTab.Settings
+                        focus = PauseFocus.TabSettings
+                    }
+                    PauseFocus.DialogCancel -> sessionViewModel.dismissExitConfirmation()
+                    PauseFocus.DialogConfirm -> sessionViewModel.confirmExit(activity)
+                }
+                true
+            }
+            else -> false
+        }
+    }
+
+    DisposableEffect(uiState.showMenu, uiState.showExitConfirmation) {
+        if (uiState.showMenu || uiState.showExitConfirmation) {
+            PauseMenuKeyDispatcher.listener = { onControllerKey(it) }
+        } else {
+            PauseMenuKeyDispatcher.listener = null
+        }
+        onDispose { PauseMenuKeyDispatcher.listener = null }
     }
 
     LaunchedEffect(uiState.isEditingControls) {
@@ -238,11 +488,13 @@ private fun EmulationPauseMenu(
                     globalSettingsViewModel = globalSettingsViewModel,
                     connectedGamepads = connectedGamepads,
                     selectedTab = selectedTab,
+                    focus = focus,
                     onSelectedTabChange = {
                         if (it != PauseMenuTab.Settings) {
                             requestedSettingsScope = null
                         }
                         selectedTab = it
+                        focus = it.toFocus()
                     },
                     onOpenSettingsTab = {
                         requestedSettingsScope = PauseSettingsScope.CustomConfig
@@ -266,7 +518,10 @@ private fun EmulationPauseMenu(
                 Text(stringResource(R.string.emulation_exit_message))
             },
             confirmButton = {
-                TextButton(onClick = { sessionViewModel.confirmExit(activity) }) {
+                TextButton(
+                    onClick = { sessionViewModel.confirmExit(activity) },
+                    modifier = Modifier.controllerHighlight(focus == PauseFocus.DialogConfirm)
+                ) {
                     Text(
                         text = stringResource(R.string.emulation_exit),
                         color = MaterialTheme.colorScheme.error
@@ -274,7 +529,10 @@ private fun EmulationPauseMenu(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { sessionViewModel.dismissExitConfirmation() }) {
+                TextButton(
+                    onClick = { sessionViewModel.dismissExitConfirmation() },
+                    modifier = Modifier.controllerHighlight(focus == PauseFocus.DialogCancel)
+                ) {
                     Text(stringResource(R.string.action_cancel))
                 }
             }
@@ -376,6 +634,7 @@ private fun PauseDrawer(
     globalSettingsViewModel: SettingsViewModel,
     connectedGamepads: List<org.vita3k.emulator.ConnectedGamepad>,
     selectedTab: PauseMenuTab,
+    focus: PauseFocus,
     onSelectedTabChange: (PauseMenuTab) -> Unit,
     onOpenSettingsTab: () -> Unit,
     requestedSettingsScope: PauseSettingsScope?,
@@ -411,6 +670,7 @@ private fun PauseDrawer(
             PauseHeader(
                 title = uiState.gameTitle.ifBlank { uiState.titleId.ifBlank { stringResource(R.string.emulation_menu_title) } },
                 subtitle = uiState.titleId.ifBlank { stringResource(R.string.emulation_menu_subtitle) },
+                closeSelected = focus == PauseFocus.Close,
                 onClose = { sessionViewModel.closeMenu(activity) }
             )
 
@@ -420,6 +680,7 @@ private fun PauseDrawer(
 
             PauseTabRow(
                 selected = selectedTab,
+                focus = focus,
                 onSelected = onSelectedTabChange
             )
 
@@ -428,6 +689,7 @@ private fun PauseDrawer(
                     activity = activity,
                     sessionViewModel = sessionViewModel,
                     settingsViewModel = settingsViewModel,
+                    focus = focus,
                     onOpenSettingsTab = onOpenSettingsTab,
                     onNeedsRestart = onNeedsRestart
                 )
@@ -469,6 +731,7 @@ private fun PauseDrawer(
 private fun PauseHeader(
     title: String,
     subtitle: String,
+    closeSelected: Boolean,
     onClose: () -> Unit
 ) {
     Surface(
@@ -497,7 +760,10 @@ private fun PauseHeader(
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            IconButton(onClick = onClose) {
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier.controllerHighlight(closeSelected)
+            ) {
                 Icon(
                     imageVector = Icons.Default.Close,
                     contentDescription = stringResource(R.string.emulation_menu_close),
@@ -511,6 +777,7 @@ private fun PauseHeader(
 @Composable
 private fun PauseTabRow(
     selected: PauseMenuTab,
+    focus: PauseFocus,
     onSelected: (PauseMenuTab) -> Unit
 ) {
     Row(
@@ -523,6 +790,7 @@ private fun PauseTabRow(
             FilterChip(
                 selected = tab == selected,
                 onClick = { onSelected(tab) },
+                modifier = Modifier.controllerHighlight(focus == tab.toFocus()),
                 colors = settingsFilterChipColors(),
                 leadingIcon = {
                     Icon(
@@ -563,6 +831,7 @@ private fun SessionTab(
     activity: Emulator,
     sessionViewModel: EmulationSessionViewModel,
     settingsViewModel: SettingsViewModel,
+    focus: PauseFocus,
     onOpenSettingsTab: () -> Unit,
     onNeedsRestart: (List<RestartRequiredSetting>) -> Unit
 ) {
@@ -576,7 +845,9 @@ private fun SessionTab(
         ) {
             FilledTonalButton(
                 onClick = { sessionViewModel.togglePause(activity) },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier
+                    .weight(1f)
+                    .controllerHighlight(focus == PauseFocus.Resume)
             ) {
                 Icon(
                     imageVector = if (uiState.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
@@ -587,7 +858,9 @@ private fun SessionTab(
             }
             FilledTonalButton(
                 onClick = { sessionViewModel.requestExit() },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier
+                    .weight(1f)
+                    .controllerHighlight(focus == PauseFocus.Exit)
             ) {
                 Icon(Icons.AutoMirrored.Filled.ExitToApp, contentDescription = null)
                 Spacer(modifier = Modifier.padding(horizontal = 4.dp))
@@ -602,6 +875,7 @@ private fun SessionTab(
             settingsLoaded = settingsLoaded,
             hasCustomConfig = settingsViewModel.hasCustomConfig,
             saving = settingsViewModel.saving,
+            focus = focus,
             onSave = {
                 settingsViewModel.save(forceCustomConfig = true) { restartRequired ->
                     sessionViewModel.promoteOverlayToGameOverride(activity)
@@ -636,6 +910,7 @@ private fun CustomConfigSection(
     settingsLoaded: Boolean,
     hasCustomConfig: Boolean,
     saving: Boolean,
+    focus: PauseFocus,
     onSave: () -> Unit,
     onReset: () -> Unit,
     onOpenSettings: () -> Unit
@@ -677,6 +952,7 @@ private fun CustomConfigSection(
                     modifier = Modifier
                         .weight(1f)
                         .height(44.dp)
+                        .controllerHighlight(focus == PauseFocus.SaveConfig)
                 ) {
                     Icon(Icons.Default.Save, contentDescription = null)
                     Spacer(modifier = Modifier.padding(horizontal = 3.dp))
@@ -698,6 +974,7 @@ private fun CustomConfigSection(
                     modifier = Modifier
                         .weight(1f)
                         .height(44.dp)
+                        .controllerHighlight(focus == PauseFocus.ResetConfig)
                 ) {
                     Icon(Icons.Default.Restore, contentDescription = null)
                     Spacer(modifier = Modifier.padding(horizontal = 3.dp))
@@ -712,7 +989,8 @@ private fun CustomConfigSection(
                 onClick = onOpenSettings,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(44.dp),
+                    .height(44.dp)
+                    .controllerHighlight(focus == PauseFocus.OpenSettings),
                 enabled = settingsLoaded
             ) {
                 Icon(Icons.Default.Settings, contentDescription = null)

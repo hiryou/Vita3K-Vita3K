@@ -2,6 +2,7 @@
 -keep class org.libsdl.app** { *; }
 -keep class org.vita3k.emulator.NativeLib { *; }
 -keep class org.vita3k.emulator.Emulator { *; }
+-keep class org.vita3k.emulator.ui.screens.emulation.PauseMenuKeyDispatcher { *; }
 -keep class org.vita3k.emulator.EmuSurface { *; }
 -keep class org.vita3k.emulator.overlay.** { *; }
 -keep class org.vita3k.emulator.data.EmulatorConfig { *; }
